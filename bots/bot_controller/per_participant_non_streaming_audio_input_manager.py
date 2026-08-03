@@ -1,4 +1,5 @@
 import logging
+import os
 import queue
 import time
 from datetime import datetime, timedelta
@@ -7,6 +8,39 @@ import numpy as np
 import webrtcvad
 
 logger = logging.getLogger(__name__)
+
+# Frames quieter than this (normalized RMS, i.e. rms/32768) are treated as
+# silence and never reach a transcription provider.
+#
+# WHY THIS IS CONFIGURABLE: the original hardcoded 0.01 is ~-40 dBFS, which is
+# far too aggressive for the per-participant audio Google Meet hands a bot. On
+# real interviews it discarded ~95% of frames, and a quieter participant could
+# be dropped ENTIRELY — process_chunk() only opens a buffer for a speaker on
+# their first non-silent frame, so a speaker who never clears this bar produces
+# no utterances at all and vanishes from the transcript. That happened to the
+# candidate in three interviews before it was caught.
+#
+# webrtcvad still runs after this check, so this is only a cheap pre-filter;
+# lowering it hands more frames to a purpose-built voice detector rather than
+# letting an amplitude heuristic decide alone.
+#
+# Default preserves upstream behaviour when the env var is unset.
+DEFAULT_SILENCE_RMS_THRESHOLD = 0.01
+
+
+def _silence_rms_threshold():
+    raw = os.getenv("AUDIO_SILENCE_RMS_THRESHOLD")
+    if not raw:
+        return DEFAULT_SILENCE_RMS_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(f"AUDIO_SILENCE_RMS_THRESHOLD is not a number: {raw!r}; using {DEFAULT_SILENCE_RMS_THRESHOLD}")
+        return DEFAULT_SILENCE_RMS_THRESHOLD
+    if not 0 <= value < 1:
+        logger.warning(f"AUDIO_SILENCE_RMS_THRESHOLD out of range (0 <= x < 1): {value}; using {DEFAULT_SILENCE_RMS_THRESHOLD}")
+        return DEFAULT_SILENCE_RMS_THRESHOLD
+    return value
 
 
 def calculate_normalized_rms(audio_bytes):
@@ -31,7 +65,9 @@ class PerParticipantNonStreamingAudioInputManager:
 
         self.UTTERANCE_SIZE_LIMIT = utterance_size_limit
         self.SILENCE_DURATION_LIMIT = silence_duration_limit
+        self.SILENCE_RMS_THRESHOLD = _silence_rms_threshold()
         self.vad = webrtcvad.Vad()
+        logger.info(f"PerParticipantNonStreamingAudioInputManager silence RMS threshold: {self.SILENCE_RMS_THRESHOLD}")
 
         self.should_print_diagnostic_info = should_print_diagnostic_info
         self.reset_diagnostic_info()
@@ -50,7 +86,20 @@ class PerParticipantNonStreamingAudioInputManager:
             "total_chunks_that_caused_vad_error": 0,
             "total_audio_chunks_sent": 0,
             "total_audio_chunks_not_sent_because_participant_not_found": 0,
+            # RMS observability — without these, a too-high threshold is
+            # indistinguishable from a genuinely silent room in the logs.
+            "rms_threshold": self.SILENCE_RMS_THRESHOLD,
+            "rms_max": 0.0,
+            "rms_mean_of_nonzero": 0.0,
+            # how many frames WOULD have passed at successively lower bars, so a
+            # sensible threshold can be read straight off a real call
+            "rms_above_threshold": 0,
+            "rms_above_0_005": 0,
+            "rms_above_0_002": 0,
+            "rms_above_0_001": 0,
         }
+        self._rms_sum = 0.0
+        self._rms_count = 0
         self.last_diagnostic_info_print_time = time.time()
 
     def print_diagnostic_info(self):
@@ -90,12 +139,25 @@ class PerParticipantNonStreamingAudioInputManager:
             self.diagnostic_info["total_chunks_that_caused_vad_error"] += 1
             return True
 
+    def record_rms(self, rms_value):
+        if rms_value > self.diagnostic_info["rms_max"]:
+            self.diagnostic_info["rms_max"] = round(float(rms_value), 5)
+        self._rms_sum += float(rms_value)
+        self._rms_count += 1
+        self.diagnostic_info["rms_mean_of_nonzero"] = round(self._rms_sum / self._rms_count, 5)
+        if rms_value >= self.SILENCE_RMS_THRESHOLD:
+            self.diagnostic_info["rms_above_threshold"] += 1
+        for bar, key in ((0.005, "rms_above_0_005"), (0.002, "rms_above_0_002"), (0.001, "rms_above_0_001")):
+            if rms_value >= bar:
+                self.diagnostic_info[key] += 1
+
     def silence_detected(self, chunk_bytes):
         rms_value = calculate_normalized_rms(chunk_bytes)
         if rms_value == 0:
             self.diagnostic_info["total_chunks_marked_as_silent_due_to_rms_being_zero"] += 1
             return True
-        if rms_value < 0.01:
+        self.record_rms(rms_value)
+        if rms_value < self.SILENCE_RMS_THRESHOLD:
             self.diagnostic_info["total_chunks_marked_as_silent_due_to_rms_being_small"] += 1
             return True
         if not self.is_speech(chunk_bytes):
